@@ -16,9 +16,30 @@
 
 suppressPackageStartupMessages({
   library(data.table)
-  library(sva)           # ComBat for batch correction
-  library(biomaRt)       # Gene coordinates for CNV & methylation mapping
   library(parallel)      # Parallel k-means discretization
+})
+
+# ── Optional packages — load gracefully so the pipeline doesn't halt ─────────
+# sva (ComBat) requires mgcv which may be absent in conda environments.
+# If it fails, batch correction is skipped with a clear warning.
+SVA_AVAILABLE <- tryCatch({
+  suppressPackageStartupMessages(library(sva))
+  TRUE
+}, error = function(e) {
+  cat("  WARNING: Could not load 'sva' (", conditionMessage(e), ")\n")
+  cat("  Batch correction will be SKIPPED.\n")
+  cat("  Fix: run install_dependencies.R, then re-run step 2.\n\n")
+  FALSE
+})
+
+# biomaRt is needed for gene-coordinate lookup (CNV mapping).
+# If unavailable, CNV gene mapping is skipped.
+BIOMART_AVAILABLE <- tryCatch({
+  suppressPackageStartupMessages(library(biomaRt))
+  TRUE
+}, error = function(e) {
+  cat("  WARNING: Could not load 'biomaRt'. CNV gene mapping will be skipped.\n\n")
+  FALSE
 })
 
 # ── Configuration ──────────────────────────────────────────────────────────────
@@ -61,10 +82,16 @@ gene_coords_file <- file.path(DATA_DIR, "gene_coordinates.rds")
 if (file.exists(gene_coords_file)) {
   gene_coords <- readRDS(gene_coords_file)
   cat("  Loaded cached gene coordinates:", nrow(gene_coords), "genes\n")
+} else if (!BIOMART_AVAILABLE) {
+  cat("  biomaRt not available — CNV gene mapping will be skipped\n")
+  gene_coords <- data.table(
+    gene_name = rownames(ge_matrix),
+    chr = NA_character_, start = NA_integer_,
+    end = NA_integer_, strand = NA_integer_, tss = NA_integer_
+  )
 } else {
   cat("  Querying Ensembl BioMart for gene coordinates...\n")
 
-  # Use biomaRt to get gene coordinates
   tryCatch({
     ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
     gene_coords <- getBM(
@@ -126,88 +153,85 @@ extract_plate <- function(barcodes) {
   return(plates)
 }
 
+# ── Shared imputation helper ──────────────────────────────────────────────────
+impute_row_means <- function(mat) {
+  row_means <- rowMeans(mat, na.rm = TRUE)
+  for (j in seq_len(ncol(mat))) {
+    na_idx <- is.na(mat[, j])
+    if (any(na_idx)) mat[na_idx, j] <- row_means[na_idx]
+  }
+  mat
+}
+
 # --- Gene Expression batch correction ---
 cat("  Correcting gene expression for batch effects...\n")
 
 ge_barcodes <- colnames(ge_matrix)
-ge_plates <- extract_plate(ge_barcodes)
+ge_plates   <- extract_plate(ge_barcodes)
 
-# Remove plates with only 1 sample (ComBat requires ≥2 per batch)
-plate_counts <- table(ge_plates)
-valid_plates <- names(plate_counts[plate_counts >= 2])
+plate_counts     <- table(ge_plates)
+valid_plates     <- names(plate_counts[plate_counts >= 2])
 valid_samples_ge <- ge_plates %in% valid_plates
 
-if (sum(valid_samples_ge) > 0 && length(unique(ge_plates[valid_samples_ge])) > 1) {
+if (!SVA_AVAILABLE) {
+  cat("  sva not available — skipping ComBat (results will be uncorrected)\n")
+  ge_corrected     <- ge_matrix
+  valid_samples_ge <- rep(TRUE, ncol(ge_matrix))
+
+} else if (sum(valid_samples_ge) > 0 && length(unique(ge_plates[valid_samples_ge])) > 1) {
   ge_corrected <- tryCatch({
-    # ComBat requires no missing values — impute NAs with row means
-    ge_temp <- ge_matrix[, valid_samples_ge]
-    row_means <- rowMeans(ge_temp, na.rm = TRUE)
-    for (j in seq_len(ncol(ge_temp))) {
-      na_idx <- is.na(ge_temp[, j])
-      ge_temp[na_idx, j] <- row_means[na_idx]
-    }
-
-    # Remove zero-variance genes
+    ge_temp  <- ge_matrix[, valid_samples_ge]
+    ge_temp  <- impute_row_means(ge_temp)
     gene_var <- apply(ge_temp, 1, var, na.rm = TRUE)
-    ge_temp <- ge_temp[gene_var > 1e-10, ]
-
-    batch <- as.factor(ge_plates[valid_samples_ge])
+    ge_temp  <- ge_temp[gene_var > 1e-10, ]
+    batch    <- as.factor(ge_plates[valid_samples_ge])
     corrected <- ComBat(dat = ge_temp, batch = batch, par.prior = TRUE)
     cat("  ComBat batch correction applied to expression data\n")
     corrected
   }, error = function(e) {
-    cat("  ComBat failed:", e$message, "\n")
-    cat("  Proceeding without batch correction\n")
+    cat("  ComBat failed:", e$message, " — proceeding without correction\n")
     ge_matrix[, valid_samples_ge]
   })
 } else {
   cat("  Insufficient batch variation for ComBat, skipping\n")
-  ge_corrected <- ge_matrix
+  ge_corrected     <- ge_matrix
   valid_samples_ge <- rep(TRUE, ncol(ge_matrix))
 }
 
 # --- Methylation batch correction ---
 cat("  Correcting methylation for batch effects...\n")
 
-meth_barcodes <- colnames(meth_matrix)
-meth_plates <- extract_plate(meth_barcodes)
-plate_counts_meth <- table(meth_plates)
-valid_plates_meth <- names(plate_counts_meth[plate_counts_meth >= 2])
+meth_barcodes      <- colnames(meth_matrix)
+meth_plates        <- extract_plate(meth_barcodes)
+plate_counts_meth  <- table(meth_plates)
+valid_plates_meth  <- names(plate_counts_meth[plate_counts_meth >= 2])
 valid_samples_meth <- meth_plates %in% valid_plates_meth
 
-if (sum(valid_samples_meth) > 0 && length(unique(meth_plates[valid_samples_meth])) > 1) {
+if (!SVA_AVAILABLE) {
+  cat("  sva not available — skipping methylation ComBat\n")
+  meth_corrected     <- meth_matrix[rowMeans(is.na(meth_matrix)) < 0.5, ]
+  valid_samples_meth <- rep(TRUE, ncol(meth_matrix))
+
+} else if (sum(valid_samples_meth) > 0 && length(unique(meth_plates[valid_samples_meth])) > 1) {
   meth_corrected <- tryCatch({
     meth_temp <- meth_matrix[, valid_samples_meth]
-
-    # Remove probes with too many NAs (>50%)
-    na_frac <- rowMeans(is.na(meth_temp))
+    na_frac   <- rowMeans(is.na(meth_temp))
     meth_temp <- meth_temp[na_frac < 0.5, ]
-
-    # Impute remaining NAs with row means
-    row_means <- rowMeans(meth_temp, na.rm = TRUE)
-    for (j in seq_len(ncol(meth_temp))) {
-      na_idx <- is.na(meth_temp[, j])
-      meth_temp[na_idx, j] <- row_means[na_idx]
-    }
-
-    # Remove zero-variance probes
+    meth_temp <- impute_row_means(meth_temp)
     probe_var <- apply(meth_temp, 1, var, na.rm = TRUE)
     meth_temp <- meth_temp[probe_var > 1e-10, ]
-
-    batch <- as.factor(meth_plates[valid_samples_meth])
+    batch     <- as.factor(meth_plates[valid_samples_meth])
     corrected <- ComBat(dat = meth_temp, batch = batch, par.prior = TRUE)
     cat("  ComBat batch correction applied to methylation data\n")
     corrected
   }, error = function(e) {
-    cat("  ComBat failed for methylation:", e$message, "\n")
-    cat("  Proceeding without batch correction\n")
+    cat("  ComBat failed for methylation:", e$message, " — proceeding without correction\n")
     meth_temp <- meth_matrix[, valid_samples_meth]
-    na_frac <- rowMeans(is.na(meth_temp))
-    meth_temp[na_frac < 0.5, ]
+    meth_temp[rowMeans(is.na(meth_temp)) < 0.5, ]
   })
 } else {
   cat("  Insufficient batch variation for methylation ComBat, skipping\n")
-  meth_corrected <- meth_matrix
+  meth_corrected     <- meth_matrix
   valid_samples_meth <- rep(TRUE, ncol(meth_matrix))
 }
 
