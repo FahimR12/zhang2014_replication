@@ -22,8 +22,16 @@ suppressPackageStartupMessages({
 })
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-DATA_DIR    <- "data"
-RESULTS_DIR <- "results"
+args_full <- commandArgs(trailingOnly = FALSE)
+file_arg <- "--file="
+script_path <- sub(file_arg, "", args_full[grep(file_arg, args_full)])
+PROJECT_DIR <- if (length(script_path) > 0) {
+  dirname(normalizePath(script_path, winslash = "/", mustWork = FALSE))
+} else {
+  normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+}
+DATA_DIR <- file.path(PROJECT_DIR, "data")
+RESULTS_DIR <- file.path(PROJECT_DIR, "results")
 PLOTS_DIR   <- "plots"
 dir.create(PLOTS_DIR, recursive = TRUE, showWarnings = FALSE)
 

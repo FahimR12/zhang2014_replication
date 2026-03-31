@@ -18,20 +18,25 @@ suppressPackageStartupMessages({
   library(data.table)
   library(sva)           # ComBat for batch correction
   library(biomaRt)       # Gene coordinates for CNV & methylation mapping
+  library(parallel)      # Parallel k-means discretization
 })
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-DATA_DIR <- file.path(dirname(getwd()), "zhang2014_replication", "data")
-# If running from the project directory:
-if (!dir.exists(DATA_DIR)) {
-  DATA_DIR <- file.path("data")
+args_full <- commandArgs(trailingOnly = FALSE)
+file_arg <- "--file="
+script_path <- sub(file_arg, "", args_full[grep(file_arg, args_full)])
+PROJECT_DIR <- if (length(script_path) > 0) {
+  dirname(normalizePath(script_path, winslash = "/", mustWork = FALSE))
+} else {
+  normalizePath(getwd(), winslash = "/", mustWork = FALSE)
 }
-if (!dir.exists(DATA_DIR)) {
-  DATA_DIR <- file.path(".", "data")
-}
+DATA_DIR <- file.path(PROJECT_DIR, "data")
+
+N_CORES <- min(8L, max(1L, detectCores() - 1L))
 
 cat("=== Zhang et al. 2014 Replication — Step 2: Preprocessing ===\n")
-cat("Data dir:", DATA_DIR, "\n\n")
+cat("Data dir:", DATA_DIR, "\n")
+cat("Parallel workers:", N_CORES, "\n\n")
 
 # ── Load saved matrices from Step 1 ──────────────────────────────────────────
 ge_matrix   <- readRDS(file.path(DATA_DIR, "ge_matrix.rds"))
@@ -216,48 +221,46 @@ cat("\n── Mapping CNV Segments to Genes ────────────
 # Genes spanning two segments were not assigned a value (236 out of 15,352)
 
 if (!all(is.na(gene_coords$chr))) {
-  cat("  Mapping segments to", nrow(gene_coords), "genes...\n")
+  cat("  Mapping segments to", nrow(gene_coords), "genes using", N_CORES, "cores...\n")
 
   unique_cnv_samples <- unique(cnv_segments$sample_barcode)
-  cnv_gene_matrix <- matrix(NA_real_, nrow = nrow(gene_coords),
-                            ncol = length(unique_cnv_samples))
-  rownames(cnv_gene_matrix) <- gene_coords$gene_name
-  colnames(cnv_gene_matrix) <- unique_cnv_samples
 
-  pb <- txtProgressBar(min = 0, max = length(unique_cnv_samples), style = 3)
+  # ── Parallel CNV mapping: one job per sample ──────────────────────────────
+  # Each worker receives the segment table for one sample and maps all genes.
+  # This is the dominant bottleneck (1564 samples × ~15K genes).
+  cl <- makeCluster(N_CORES, type = "PSOCK")
+  clusterEvalQ(cl, suppressPackageStartupMessages(library(data.table)))
+  clusterExport(cl, c("cnv_segments", "gene_coords", "unique_cnv_samples"))
 
-  for (s in seq_along(unique_cnv_samples)) {
-    sample_id <- unique_cnv_samples[s]
-    sample_segs <- cnv_segments[sample_barcode == sample_id]
+  cnv_per_sample <- parLapply(cl, unique_cnv_samples, function(sample_id) {
+    segs <- cnv_segments[sample_barcode == sample_id]
+    segs[, chr_clean := gsub("^chr", "", Chromosome)]
 
-    # Normalize chromosome names
-    sample_segs[, chr_clean := gsub("^chr", "", Chromosome)]
+    vals <- numeric(nrow(gene_coords))
+    vals[] <- NA_real_
 
     for (g in seq_len(nrow(gene_coords))) {
       gc <- gene_coords[g]
       if (is.na(gc$chr)) next
 
-      # Find overlapping segments
-      overlapping <- sample_segs[
-        chr_clean == gc$chr &
-        Start <= gc$start &
-        End >= gc$end
-      ]
-
-      if (nrow(overlapping) == 1) {
-        cnv_gene_matrix[g, s] <- overlapping$Segment_Mean[1]
-      } else if (nrow(overlapping) > 1) {
-        # If gene spans multiple segments, take weighted average by overlap
-        cnv_gene_matrix[g, s] <- mean(overlapping$Segment_Mean)
+      ov <- segs[chr_clean == gc$chr & Start <= gc$start & End >= gc$end]
+      if (nrow(ov) == 1) {
+        vals[g] <- ov$Segment_Mean[1]
+      } else if (nrow(ov) > 1) {
+        vals[g] <- mean(ov$Segment_Mean)
       }
-      # If no segment fully contains the gene, leave as NA
     }
+    vals
+  })
 
-    setTxtProgressBar(pb, s)
-  }
-  close(pb)
+  stopCluster(cl)
 
-  # Count mapped genes
+  # Assemble matrix from list of column vectors
+  cnv_gene_matrix           <- do.call(cbind, cnv_per_sample)
+  rownames(cnv_gene_matrix) <- gene_coords$gene_name
+  colnames(cnv_gene_matrix) <- unique_cnv_samples
+  rm(cnv_per_sample); gc()
+
   mapped_genes <- sum(rowSums(!is.na(cnv_gene_matrix)) > 0)
   cat("  Genes with CNV data:", mapped_genes, "\n")
 } else {
@@ -384,72 +387,54 @@ if (!is.null(probe_gene_map)) {
 # =============================================================================
 cat("\n── Discretizing Variables ─────────────────────────────────\n")
 
-# --- E1. Gene Expression: k-means into low/medium/high ---
-cat("  Discretizing gene expression (k-means, k=3)...\n")
-
-discretize_expression <- function(expr_vec) {
-  # Remove NAs for clustering
-  valid <- !is.na(expr_vec)
-  if (sum(valid) < 10) return(rep(NA_integer_, length(expr_vec)))
-
-  result <- rep(NA_integer_, length(expr_vec))
-  km <- tryCatch({
-    kmeans(expr_vec[valid], centers = 3, nstart = 10, iter.max = 50)
-  }, error = function(e) NULL)
-
+# ── Shared k-means discretizer (exported to workers) ─────────────────────────
+discretize_vec <- function(vec, k) {
+  valid <- !is.na(vec)
+  if (sum(valid) < 10) return(rep(NA_integer_, length(vec)))
+  result <- rep(NA_integer_, length(vec))
+  km <- tryCatch(kmeans(vec[valid], centers = k, nstart = 10, iter.max = 50),
+                 error = function(e) NULL)
   if (is.null(km)) return(result)
-
-  # Order clusters by center value: 1=low, 2=medium, 3=high
-  center_order <- order(km$centers[, 1])
-  cluster_map <- setNames(seq_along(center_order), center_order)
-  result[valid] <- as.integer(cluster_map[as.character(km$cluster)])
-  return(result)
+  ord <- order(km$centers[, 1])
+  cmap <- setNames(seq_along(ord), ord)
+  result[valid] <- as.integer(cmap[as.character(km$cluster)])
+  result
 }
 
-ge_discrete <- matrix(NA_integer_, nrow = nrow(ge_corrected), ncol = ncol(ge_corrected))
+# --- E1. Gene Expression: k-means into low/medium/high (parallelised) ---
+cat("  Discretizing gene expression (k-means k=3,", N_CORES, "cores)...\n")
+
+cl <- makeCluster(N_CORES, type = "PSOCK")
+clusterExport(cl, c("discretize_vec", "ge_corrected"))
+
+ge_disc_rows <- parLapply(cl, seq_len(nrow(ge_corrected)), function(i)
+  discretize_vec(ge_corrected[i, ], k = 3L))
+
+stopCluster(cl)
+
+ge_discrete <- do.call(rbind, ge_disc_rows)
+storage.mode(ge_discrete) <- "integer"
 rownames(ge_discrete) <- rownames(ge_corrected)
 colnames(ge_discrete) <- colnames(ge_corrected)
-
-pb <- txtProgressBar(min = 0, max = nrow(ge_corrected), style = 3)
-for (i in seq_len(nrow(ge_corrected))) {
-  ge_discrete[i, ] <- discretize_expression(ge_corrected[i, ])
-  setTxtProgressBar(pb, i)
-}
-close(pb)
+rm(ge_disc_rows); gc()
 cat("  Expression discretized: low=1, medium=2, high=3\n")
 
-# --- E2. Methylation: k-means into hypo/hyper ---
-cat("  Discretizing methylation (k-means, k=2)...\n")
+# --- E2. Methylation: k-means into hypo/hyper (parallelised) ---
+cat("  Discretizing methylation (k-means k=2,", N_CORES, "cores)...\n")
 
-discretize_methylation <- function(meth_vec) {
-  valid <- !is.na(meth_vec)
-  if (sum(valid) < 10) return(rep(NA_integer_, length(meth_vec)))
+cl <- makeCluster(N_CORES, type = "PSOCK")
+clusterExport(cl, c("discretize_vec", "meth_gene_matrix"))
 
-  result <- rep(NA_integer_, length(meth_vec))
-  km <- tryCatch({
-    kmeans(meth_vec[valid], centers = 2, nstart = 10, iter.max = 50)
-  }, error = function(e) NULL)
+meth_disc_rows <- parLapply(cl, seq_len(nrow(meth_gene_matrix)), function(i)
+  discretize_vec(meth_gene_matrix[i, ], k = 2L))
 
-  if (is.null(km)) return(result)
+stopCluster(cl)
 
-  # Order: 1=hypo (low methylation), 2=hyper (high methylation)
-  center_order <- order(km$centers[, 1])
-  cluster_map <- setNames(seq_along(center_order), center_order)
-  result[valid] <- as.integer(cluster_map[as.character(km$cluster)])
-  return(result)
-}
-
-meth_discrete <- matrix(NA_integer_, nrow = nrow(meth_gene_matrix),
-                        ncol = ncol(meth_gene_matrix))
+meth_discrete <- do.call(rbind, meth_disc_rows)
+storage.mode(meth_discrete) <- "integer"
 rownames(meth_discrete) <- rownames(meth_gene_matrix)
 colnames(meth_discrete) <- colnames(meth_gene_matrix)
-
-pb <- txtProgressBar(min = 0, max = nrow(meth_gene_matrix), style = 3)
-for (i in seq_len(nrow(meth_gene_matrix))) {
-  meth_discrete[i, ] <- discretize_methylation(meth_gene_matrix[i, ])
-  setTxtProgressBar(pb, i)
-}
-close(pb)
+rm(meth_disc_rows); gc()
 cat("  Methylation discretized: hypo=1, hyper=2\n")
 
 # --- E3. CNV: gain/loss binary ---

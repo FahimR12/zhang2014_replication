@@ -18,13 +18,23 @@
 
 suppressPackageStartupMessages({
   library(data.table)
+  library(parallel)
 })
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-DATA_DIR <- "data"
-if (!dir.exists(DATA_DIR)) DATA_DIR <- file.path(".", "data")
+args_full <- commandArgs(trailingOnly = FALSE)
+file_arg <- "--file="
+script_path <- sub(file_arg, "", args_full[grep(file_arg, args_full)])
+PROJECT_DIR <- if (length(script_path) > 0) {
+  dirname(normalizePath(script_path, winslash = "/", mustWork = FALSE))
+} else {
+  normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+}
+DATA_DIR <- file.path(PROJECT_DIR, "data")
+N_CORES  <- min(8L, max(1L, detectCores() - 1L))
 
-cat("=== Zhang et al. 2014 Replication — Step 3: Feature Selection ===\n\n")
+cat("=== Zhang et al. 2014 Replication — Step 3: Feature Selection ===\n")
+cat("Parallel workers:", N_CORES, "\n\n")
 
 # ── Load preprocessed data ────────────────────────────────────────────────────
 ge_discrete    <- readRDS(file.path(DATA_DIR, "ge_aligned.rds"))
@@ -104,33 +114,29 @@ n_normal <- sum(is_normal, na.rm = TRUE)
 cat("  Tumor samples:", n_tumor, "| Normal samples:", n_normal, "\n")
 
 if (n_normal >= 3) {
-  cat("  Running Wilcoxon rank-sum tests...\n")
+  cat("  Running Wilcoxon rank-sum tests using", N_CORES, "cores...\n")
+
+  # ── Parallel Wilcoxon: one job per gene ───────────────────────────────────
+  cl <- makeCluster(N_CORES, type = "PSOCK")
+  clusterExport(cl, c("ge_continuous", "is_tumor", "is_normal"))
+
+  wilcox_raw <- parLapply(cl, seq_len(nrow(ge_continuous)), function(i) {
+    tv <- ge_continuous[i, is_tumor];  tv <- tv[!is.na(tv)]
+    nv <- ge_continuous[i, is_normal]; nv <- nv[!is.na(nv)]
+    if (length(tv) < 3 || length(nv) < 3) return(c(NA_real_, NA_real_))
+    p  <- tryCatch(wilcox.test(tv, nv)$p.value, error = function(e) NA_real_)
+    c(p, abs(mean(tv) - mean(nv)))
+  })
+
+  stopCluster(cl)
 
   wilcox_results <- data.table(
-    gene = rownames(ge_continuous),
-    p_value = NA_real_,
-    effect_size = NA_real_
+    gene        = rownames(ge_continuous),
+    p_value     = sapply(wilcox_raw, `[`, 1),
+    effect_size = sapply(wilcox_raw, `[`, 2)
   )
+  rm(wilcox_raw); gc()
 
-  for (i in seq_len(nrow(ge_continuous))) {
-    tumor_vals <- ge_continuous[i, is_tumor]
-    normal_vals <- ge_continuous[i, is_normal]
-
-    # Remove NAs
-    tumor_vals <- tumor_vals[!is.na(tumor_vals)]
-    normal_vals <- normal_vals[!is.na(normal_vals)]
-
-    if (length(tumor_vals) >= 3 && length(normal_vals) >= 3) {
-      test <- tryCatch(
-        wilcox.test(tumor_vals, normal_vals),
-        error = function(e) list(p.value = NA)
-      )
-      wilcox_results$p_value[i] <- test$p.value
-      wilcox_results$effect_size[i] <- abs(mean(tumor_vals) - mean(normal_vals))
-    }
-  }
-
-  # BH correction
   wilcox_results$fdr <- p.adjust(wilcox_results$p_value, method = "BH")
   sig_genes_expr <- wilcox_results[fdr <= 0.05]$gene
   cat("  Significantly DE genes (FDR ≤ 0.05):", length(sig_genes_expr), "\n")
@@ -163,17 +169,18 @@ if (n_normal >= 3 && nrow(meth_continuous) > 0) {
   is_normal_meth <- meth_sample_types %in% 10:14
 
   if (sum(is_normal_meth) >= 3) {
-    wilcox_meth <- data.table(probe = rownames(meth_continuous), p_value = NA_real_)
-    for (i in seq_len(nrow(meth_continuous))) {
-      t_vals <- meth_continuous[i, is_tumor_meth]
-      n_vals <- meth_continuous[i, is_normal_meth]
-      t_vals <- t_vals[!is.na(t_vals)]
-      n_vals <- n_vals[!is.na(n_vals)]
-      if (length(t_vals) >= 3 && length(n_vals) >= 3) {
-        test <- tryCatch(wilcox.test(t_vals, n_vals), error = function(e) list(p.value = NA))
-        wilcox_meth$p_value[i] <- test$p.value
-      }
-    }
+    cl <- makeCluster(N_CORES, type = "PSOCK")
+    clusterExport(cl, c("meth_continuous", "is_tumor_meth", "is_normal_meth"))
+    meth_p_raw <- parLapply(cl, seq_len(nrow(meth_continuous)), function(i) {
+      tv <- meth_continuous[i, is_tumor_meth];  tv <- tv[!is.na(tv)]
+      nv <- meth_continuous[i, is_normal_meth]; nv <- nv[!is.na(nv)]
+      if (length(tv) < 3 || length(nv) < 3) return(NA_real_)
+      tryCatch(wilcox.test(tv, nv)$p.value, error = function(e) NA_real_)
+    })
+    stopCluster(cl)
+    wilcox_meth <- data.table(probe   = rownames(meth_continuous),
+                              p_value = unlist(meth_p_raw))
+    rm(meth_p_raw); gc()
     wilcox_meth$fdr <- p.adjust(wilcox_meth$p_value, method = "BH")
     sig_genes_meth <- wilcox_meth[fdr <= 0.05]$probe
     cat("  Significantly DM genes (FDR ≤ 0.05):", length(sig_genes_meth), "\n")
@@ -331,84 +338,87 @@ cat("\n── Stepwise Correlation-Based Selection (SCBS) ───────�
 # Recommended k = 4, 5, or 6.
 
 run_scbs <- function(seed_genes, feature_matrix, k = 5, max_features = 300,
-                     fdr_threshold = 0.05) {
-  # seed_genes: character vector of starting gene names
+                     fdr_threshold = 0.05, n_cores = 1L) {
+  # seed_genes    : character vector of starting gene names
   # feature_matrix: continuous gene × sample matrix (all candidate features)
-  # k: number of top correlated features to consider at each step
-  # max_features: maximum features to select
-  # fdr_threshold: BH-adjusted p-value threshold
+  # k             : top-k most correlated neighbours considered per node
+  # max_features  : stop when this many features selected
+  # fdr_threshold : BH FDR cutoff
+  # n_cores       : PSOCK workers for the correlation sweep (Windows-safe)
 
-  cat("    SCBS: starting with", length(seed_genes), "seeds, k =", k, "\n")
+  cat("    SCBS: starting with", length(seed_genes), "seeds, k =", k,
+      ", cores =", n_cores, "\n")
 
-  selected <- seed_genes[seed_genes %in% rownames(feature_matrix)]
+  selected  <- seed_genes[seed_genes %in% rownames(feature_matrix)]
   remaining <- setdiff(rownames(feature_matrix), selected)
-  n_samples <- ncol(feature_matrix)
+
+  # ── One-time parallel cluster for correlation sweeps ─────────────────────
+  cl <- makeCluster(n_cores, type = "PSOCK")
+  clusterEvalQ(cl, {})   # warm up
+  on.exit(stopCluster(cl), add = TRUE)
 
   iteration <- 0
   while (length(selected) < max_features && length(remaining) > 0) {
-    iteration <- iteration + 1
-    new_selected <- character(0)
+    iteration  <- iteration + 1
+    candidates <- character(0)
 
     for (node in selected) {
       if (length(remaining) == 0) break
-
-      # Step 1: Calculate correlations between current node and all remaining
       node_vals <- feature_matrix[node, ]
 
-      cors <- sapply(remaining, function(r) {
-        r_vals <- feature_matrix[r, ]
-        valid <- !is.na(node_vals) & !is.na(r_vals)
-        if (sum(valid) < 10) return(0)
-        tryCatch(cor(node_vals[valid], r_vals[valid], method = "pearson"),
-                 error = function(e) 0)
+      # ── Parallel correlation of node vs all remaining features ──────────
+      clusterExport(cl, c("node_vals", "feature_matrix", "remaining"),
+                    envir = environment())
+
+      cors_raw <- parLapply(cl, remaining, function(r) {
+        rv    <- feature_matrix[r, ]
+        valid <- !is.na(node_vals) & !is.na(rv)
+        if (sum(valid) < 10L) return(0)
+        tryCatch(cor(node_vals[valid], rv[valid]), error = function(e) 0)
       })
 
-      # Keep top k by absolute correlation
-      top_k <- names(sort(abs(cors), decreasing = TRUE))[1:min(k, length(cors))]
+      cors      <- setNames(unlist(cors_raw), remaining)
+      top_k     <- names(sort(abs(cors), decreasing = TRUE))[1:min(k, length(cors))]
 
-      # Step 2: Test significance
-      for (candidate in top_k) {
-        c_vals <- feature_matrix[candidate, ]
-        valid <- !is.na(node_vals) & !is.na(c_vals)
-        if (sum(valid) < 10) next
-
-        # Correlation test
-        test <- tryCatch(cor.test(node_vals[valid], c_vals[valid], method = "pearson"),
-                         error = function(e) list(p.value = 1))
-
-        # We'll collect all p-values and apply BH correction at the end of this iteration
-        if (test$p.value < 0.05) {  # pre-filter
-          new_selected <- c(new_selected, candidate)
-        }
+      # Quick pre-filter (p < 0.05 unadjusted)
+      for (cand in top_k) {
+        cv    <- feature_matrix[cand, ]
+        valid <- !is.na(node_vals) & !is.na(cv)
+        if (sum(valid) < 10L) next
+        p <- tryCatch(cor.test(node_vals[valid], cv[valid])$p.value,
+                      error = function(e) 1)
+        if (!is.na(p) && p < 0.05) candidates <- c(candidates, cand)
       }
     }
 
-    new_selected <- unique(new_selected)
+    candidates <- unique(candidates)
+    if (length(candidates) == 0) break
 
-    # Apply BH correction across all candidates in this iteration
-    if (length(new_selected) > 0) {
-      p_values <- sapply(new_selected, function(cand) {
-        # Calculate minimum p-value of correlation with any selected node
-        min_p <- 1
-        for (node in selected) {
-          node_vals <- feature_matrix[node, ]
-          c_vals <- feature_matrix[cand, ]
-          valid <- !is.na(node_vals) & !is.na(c_vals)
-          if (sum(valid) < 10) next
-          test <- tryCatch(cor.test(node_vals[valid], c_vals[valid]),
-                           error = function(e) list(p.value = 1))
-          min_p <- min(min_p, test$p.value)
-        }
-        return(min_p)
-      })
+    # ── BH correction across all candidates this iteration ────────────────
+    # Parallel: compute min-p over all selected nodes for each candidate
+    clusterExport(cl, c("candidates", "selected", "feature_matrix"),
+                  envir = environment())
 
-      fdr <- p.adjust(p_values, method = "BH")
-      sig_new <- new_selected[fdr <= fdr_threshold]
+    minp_raw <- parLapply(cl, candidates, function(cand) {
+      cv   <- feature_matrix[cand, ]
+      minp <- 1
+      for (nd in selected) {
+        nv    <- feature_matrix[nd, ]
+        valid <- !is.na(nv) & !is.na(cv)
+        if (sum(valid) < 10L) next
+        p <- tryCatch(cor.test(nv[valid], cv[valid])$p.value,
+                      error = function(e) 1)
+        if (!is.na(p)) minp <- min(minp, p)
+      }
+      minp
+    })
 
-      if (length(sig_new) == 0) break  # No new features pass threshold
+    fdr     <- p.adjust(unlist(minp_raw), method = "BH")
+    sig_new <- candidates[fdr <= fdr_threshold]
+    if (length(sig_new) == 0) break
 
-      selected <- c(selected, sig_new)
-      remaining <- setdiff(remaining, sig_new)
+    selected  <- c(selected, sig_new)
+    remaining <- setdiff(remaining, sig_new)
 
       if (iteration %% 5 == 0 || iteration <= 3) {
         cat("    Iteration", iteration, ": selected", length(selected), "features\n")
@@ -448,14 +458,15 @@ na_frac <- rowMeans(is.na(scbs_feature_matrix))
 scbs_feature_matrix <- scbs_feature_matrix[na_frac < 0.3, ]
 cat("  Features available for SCBS:", nrow(scbs_feature_matrix), "\n")
 
-# Run SCBS
+# Run SCBS  (parallelised correlation sweeps)
 # Paper used k = 5 and selected ~271 additional features beyond the 68 seeds
 selected_genes <- run_scbs(
-  seed_genes = seed_genes_final,
+  seed_genes     = seed_genes_final,
   feature_matrix = scbs_feature_matrix,
-  k = 5,
-  max_features = 350,  # Paper got 339 total nodes
-  fdr_threshold = 0.05
+  k              = 5,
+  max_features   = 350,   # Paper got 339 total nodes
+  fdr_threshold  = 0.05,
+  n_cores        = N_CORES
 )
 
 cat("\n  SCBS selected", length(selected_genes), "gene expression features\n")
