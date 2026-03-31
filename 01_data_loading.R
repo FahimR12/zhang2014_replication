@@ -152,6 +152,97 @@ map_uuids_to_barcodes <- function(uuid_dirs) {
   all_mappings
 }
 
+map_uuids_to_barcodes <- function(uuid_dirs) {
+  file_uuids <- basename(uuid_dirs)
+  cat("  Querying GDC API for", length(file_uuids), "file UUIDs...\n")
+
+  batch_size <- 100
+  all_mappings <- data.table(
+    file_id = character(),
+    barcode = character(),
+    sample_type = character()
+  )
+
+  for (i in seq(1, length(file_uuids), by = batch_size)) {
+    batch <- file_uuids[i:min(i + batch_size - 1, length(file_uuids))]
+
+    body <- list(
+      filters = list(op = "in", content = list(field = "files.file_id", value = batch)),
+      format = "JSON",
+      fields = paste0(
+        "file_id,",
+        "cases.samples.sample_type,",
+        "cases.samples.portions.analytes.aliquots.submitter_id"
+      ),
+      size = as.character(length(batch))
+    )
+
+    resp <- tryCatch(
+      POST(
+        "https://api.gdc.cancer.gov/files",
+        body = toJSON(body, auto_unbox = TRUE),
+        content_type_json(),
+        timeout(60)
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(resp) || status_code(resp) != 200) next
+
+    result <- tryCatch(
+      fromJSON(content(resp, "text", encoding = "UTF-8"), simplifyDataFrame = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(result) || is.null(result$data$hits) || length(result$data$hits) == 0) next
+
+    for (hit in result$data$hits) {
+      fid <- hit$file_id
+      cases <- hit$cases
+      if (is.null(cases) || length(cases) == 0) next
+
+      for (case in cases) {
+        samples <- case$samples
+        if (is.null(samples) || length(samples) == 0) next
+
+        for (sample in samples) {
+          stype <- if (!is.null(sample$sample_type)) sample$sample_type else NA_character_
+          portions <- sample$portions
+          if (is.null(portions) || length(portions) == 0) next
+
+          for (portion in portions) {
+            analytes <- portion$analytes
+            if (is.null(analytes) || length(analytes) == 0) next
+
+            for (analyte in analytes) {
+              aliquots <- analyte$aliquots
+              if (is.null(aliquots) || length(aliquots) == 0) next
+
+              for (aliquot in aliquots) {
+                bc <- if (!is.null(aliquot$submitter_id)) aliquot$submitter_id else NA_character_
+                if (!is.na(bc) && nzchar(bc)) {
+                  all_mappings <- rbind(
+                    all_mappings,
+                    data.table(file_id = fid, barcode = bc, sample_type = stype)
+                  )
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (i %% 500 == 1 && i > 1) {
+      cat("    Progress:", min(i + batch_size - 1, length(file_uuids)),
+          "/", length(file_uuids), "\n")
+    }
+    Sys.sleep(0.3)
+  }
+
+  all_mappings <- unique(all_mappings, by = c("file_id", "barcode"))
+  cat("  Mapped", nrow(all_mappings), "UUID to barcode entries\n")
+  all_mappings
+}
+
 # =============================================================================
 # 1. GENE EXPRESSION  (426 samples, parallelised)
 # =============================================================================

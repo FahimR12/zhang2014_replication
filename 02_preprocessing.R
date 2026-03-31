@@ -517,6 +517,9 @@ cat("  Common patients:", length(common_patients), "\n")
 # Subset to common patients (taking tumor samples preferentially)
 subset_to_patients <- function(mat, patients, target_patients) {
   pat_ids <- patient_from_barcode(colnames(mat))
+  if (length(target_patients) == 0) {
+    return(mat[, integer(0), drop = FALSE])
+  }
   # For each target patient, find matching column
   selected_cols <- sapply(target_patients, function(p) {
     idx <- which(pat_ids == p)
@@ -528,8 +531,15 @@ subset_to_patients <- function(mat, patients, target_patients) {
     if (length(tumor_idx) > 0) return(tumor_idx[1])
     return(idx[1])
   })
-  selected_cols <- selected_cols[!is.na(selected_cols)]
+  selected_cols <- as.integer(selected_cols[!is.na(selected_cols)])
   return(mat[, selected_cols, drop = FALSE])
+}
+
+if (length(common_patients) == 0) {
+  stop(
+    "No overlapping patients across data types. ",
+    "This usually means one or more matrices still use UUID file IDs instead of TCGA barcodes."
+  )
 }
 
 ge_aligned   <- subset_to_patients(ge_discrete, ge_patients, common_patients)
