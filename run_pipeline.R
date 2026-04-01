@@ -32,35 +32,48 @@ script_path <- sub(file_arg, "", args_full[grep(file_arg, args_full)])
 script_dir <- if (length(script_path) > 0) dirname(normalizePath(script_path)) else getwd()
 setwd(script_dir)
 
+status_file <- Sys.getenv("PIPELINE_STATUS_FILE", unset = file.path("logs", "pipeline_status.txt"))
+dir.create(dirname(status_file), recursive = TRUE, showWarnings = FALSE)
+
+status_log <- function(msg) {
+  line <- sprintf("%s | %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), msg)
+  cat(line, "\n")
+  cat(line, "\n", file = status_file, append = TRUE)
+  flush.console()
+}
+
+run_step <- function(step_num, title, script_name) {
+  cat(sprintf("\n▶ Step %d/5: %s\n", step_num, title))
+  cat(strrep("─", 60), "\n")
+  status_log(sprintf("START step %d: %s", step_num, title))
+  # Use global scope so existing scripts that rely on clusterExport(..., envir=.GlobalEnv)
+  # keep working exactly as before.
+  t <- system.time(source(script_name, local = .GlobalEnv))
+  status_log(sprintf("DONE  step %d: %s (elapsed %.1f min)",
+                     step_num, title, unname(t["elapsed"]) / 60))
+}
+
+status_log(sprintf("PIPELINE START (steps=%s)", paste(steps, collapse = ",")))
+
 total_time <- system.time({
   if (1 %in% steps) {
-    cat("\n▶ Step 1/5: Data Loading\n")
-    cat(strrep("─", 60), "\n")
-    source("01_data_loading.R", local = TRUE)
+    run_step(1, "Data Loading", "01_data_loading.R")
   }
 
   if (2 %in% steps) {
-    cat("\n▶ Step 2/5: Preprocessing\n")
-    cat(strrep("─", 60), "\n")
-    source("02_preprocessing.R", local = TRUE)
+    run_step(2, "Preprocessing", "02_preprocessing.R")
   }
 
   if (3 %in% steps) {
-    cat("\n▶ Step 3/5: Feature Selection\n")
-    cat(strrep("─", 60), "\n")
-    source("03_feature_selection.R", local = TRUE)
+    run_step(3, "Feature Selection", "03_feature_selection.R")
   }
 
   if (4 %in% steps) {
-    cat("\n▶ Step 4/5: Bayesian Network Learning\n")
-    cat(strrep("─", 60), "\n")
-    source("04_bn_learning.R", local = TRUE)
+    run_step(4, "Bayesian Network Learning", "04_bn_learning.R")
   }
 
   if (5 %in% steps) {
-    cat("\n▶ Step 5/5: Analysis & Visualization\n")
-    cat(strrep("─", 60), "\n")
-    source("05_analysis.R", local = TRUE)
+    run_step(5, "Analysis & Visualization", "05_analysis.R")
   }
 })
 
@@ -68,3 +81,4 @@ cat("\n╔═══════════════════════�
 cat("║  PIPELINE COMPLETE                                      ║\n")
 cat("║  Total time:", sprintf("%-40s", paste(round(total_time["elapsed"]/60, 1), "minutes")), "║\n")
 cat("╚══════════════════════════════════════════════════════════╝\n")
+status_log(sprintf("PIPELINE COMPLETE (elapsed %.1f min)", unname(total_time["elapsed"]) / 60))

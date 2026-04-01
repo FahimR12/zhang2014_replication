@@ -33,10 +33,21 @@ DATA_DIR <- file.path(PROJECT_DIR, "data", "03_feature_selection")
 RESULTS_DIR <- file.path(PROJECT_DIR, "results", "04_bn_learning")
 dir.create(RESULTS_DIR, recursive = TRUE, showWarnings = FALSE)
 
-N_CORES <- max(1, detectCores() - 1)  # Leave one core free
+# Respect scheduler allocation first (SLURM), then fall back to local detection.
+slurm_cpus <- suppressWarnings(as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "")))
+detected_cpus <- suppressWarnings(detectCores())
+if (is.na(detected_cpus) || detected_cpus < 1) detected_cpus <- 1L
+
+if (!is.na(slurm_cpus) && slurm_cpus > 0) {
+  N_CORES <- slurm_cpus
+} else {
+  N_CORES <- max(1L, detected_cpus - 1L)  # leave one core free off scheduler
+}
 
 cat("=== Zhang et al. 2014 Replication — Step 4: BN Learning ===\n")
-cat("Using", N_CORES, "cores\n\n")
+cat("Using", N_CORES, "cores",
+    "(SLURM_CPUS_PER_TASK =", ifelse(is.na(slurm_cpus), "unset", slurm_cpus),
+    ", detected =", detected_cpus, ")\n\n")
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 bn_data <- readRDS(file.path(DATA_DIR, "bn_data.rds"))
@@ -210,14 +221,22 @@ if (!is.null(bn_h2pc)) {
 cat("\n── Bootstrap Averaging (HC, 200 replicates) ───────────────\n")
 
 t_boot <- system.time({
+  cl_boot <- NULL
+  if (N_CORES > 1L) {
+    cl_boot <- makeCluster(N_CORES, type = "PSOCK")
+    on.exit(stopCluster(cl_boot), add = TRUE)
+  }
+
   boot_strength <- tryCatch({
     boot.strength(bn_data, R = 200, algorithm = "hc",
-                  algorithm.args = list(score = "bde", iss = 10, restart = 5))
+                  algorithm.args = list(score = "bde", iss = 10, restart = 5),
+                  cluster = cl_boot)
   }, error = function(e) {
     cat("  Bootstrap failed:", e$message, "\n")
     tryCatch({
       boot.strength(bn_data, R = 100, algorithm = "hc",
-                    algorithm.args = list(score = "bic", restart = 3))
+                    algorithm.args = list(score = "bic", restart = 3),
+                    cluster = cl_boot)
     }, error = function(e2) NULL)
   })
 })

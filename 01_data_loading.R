@@ -20,7 +20,6 @@ suppressPackageStartupMessages({
 })
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-DATA_ROOT <- "C:/Users/fahim/Desktop/scripts/BNPipeline/GDCdata/TCGA-OV"
 args_full <- commandArgs(trailingOnly = FALSE)
 file_arg  <- "--file="
 script_path <- sub(file_arg, "", args_full[grep(file_arg, args_full)])
@@ -30,6 +29,8 @@ PROJECT_DIR <- if (length(script_path) > 0) {
   normalizePath(getwd(), winslash = "/", mustWork = FALSE)
 }
 DATA_ROOT_DIR <- file.path(PROJECT_DIR, "data")
+DATA_ROOT <- Sys.getenv("TCGA_OV_DATA_ROOT",
+                        unset = file.path(DATA_ROOT_DIR, "GDCdata", "TCGA-OV"))
 OUT_DIR  <- file.path(DATA_ROOT_DIR, "01_data_loading")
 dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
@@ -38,14 +39,36 @@ CNV_DIR  <- file.path(DATA_ROOT, "Copy_Number_Variation",      "Copy_Number_Segm
 METH_DIR <- file.path(DATA_ROOT, "DNA_Methylation",            "Methylation_Beta_Value")
 MUT_DIR  <- file.path(DATA_ROOT, "Simple_Nucleotide_Variation","Masked_Somatic_Mutation")
 
-# Number of parallel workers.  On Windows, PSOCK clusters can saturate disk I/O
-# past ~8 workers; tune down if reads become slower rather than faster.
-N_CORES <- min(8L, max(1L, detectCores() - 1L))
+# Number of parallel workers.
+# Respect scheduler allocation first (SLURM), then fall back to local detection.
+slurm_cpus <- suppressWarnings(as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "")))
+detected_cpus <- suppressWarnings(detectCores())
+if (is.na(detected_cpus) || detected_cpus < 1) detected_cpus <- 1L
+
+# On non-scheduler runs, cap at 8 to avoid oversaturating I/O-heavy workloads.
+N_CORES <- if (!is.na(slurm_cpus) && slurm_cpus > 0) {
+  slurm_cpus
+} else {
+  min(8L, max(1L, detected_cpus - 1L))
+}
 
 cat("=== Zhang et al. 2014 Replication — Step 1: Data Loading ===\n")
 cat("Data root:", DATA_ROOT, "\n")
 cat("Output dir:", OUT_DIR, "\n")
-cat("Parallel workers:", N_CORES, "\n\n")
+cat("Parallel workers:", N_CORES,
+    "(SLURM_CPUS_PER_TASK =", ifelse(is.na(slurm_cpus), "unset", slurm_cpus),
+    ", detected =", detected_cpus, ")\n\n")
+
+if (!dir.exists(DATA_ROOT)) {
+  stop(
+    paste0(
+      "DATA_ROOT does not exist: ", DATA_ROOT, "\n",
+      "Run `Rscript 00_fetch_gdc_data.R` to download data, or set TCGA_OV_DATA_ROOT.\n",
+      "Expected default location:\n",
+      file.path(DATA_ROOT_DIR, "GDCdata", "TCGA-OV")
+    )
+  )
+}
 
 # =============================================================================
 # HELPERS

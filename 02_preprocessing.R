@@ -56,12 +56,22 @@ INPUT_DIR <- file.path(DATA_ROOT_DIR, "01_data_loading")
 OUTPUT_DIR <- file.path(DATA_ROOT_DIR, "02_preprocessing")
 dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
-N_CORES <- min(8L, max(1L, detectCores() - 1L))
+slurm_cpus <- suppressWarnings(as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "")))
+detected_cpus <- suppressWarnings(detectCores())
+if (is.na(detected_cpus) || detected_cpus < 1) detected_cpus <- 1L
+
+N_CORES <- if (!is.na(slurm_cpus) && slurm_cpus > 0) {
+  slurm_cpus
+} else {
+  min(8L, max(1L, detected_cpus - 1L))
+}
 
 cat("=== Zhang et al. 2014 Replication — Step 2: Preprocessing ===\n")
 cat("Input dir:", INPUT_DIR, "\n")
 cat("Output dir:", OUTPUT_DIR, "\n")
-cat("Parallel workers:", N_CORES, "\n\n")
+cat("Parallel workers:", N_CORES,
+    "(SLURM_CPUS_PER_TASK =", ifelse(is.na(slurm_cpus), "unset", slurm_cpus),
+    ", detected =", detected_cpus, ")\n\n")
 
 # ── Load saved matrices from Step 1 ──────────────────────────────────────────
 ge_matrix   <- readRDS(file.path(INPUT_DIR, "ge_matrix.rds"))
