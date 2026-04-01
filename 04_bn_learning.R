@@ -175,11 +175,19 @@ if (!is.null(bn_pc)) {
 # --- 4. Max-Min Hill-Climbing (MMHC) ---
 cat("\n── 4. MMHC (hybrid) ──────────────────────────────────────\n")
 t4 <- system.time({
+  # bnlearn hybrid algorithms split arguments across two phases:
+  #   restrict.args  → constraint-based skeleton phase (test type)
+  #   maximize.args  → hill-climbing phase (score + iss)
+  # Passing test/score as top-level args causes "unused arguments" error.
   bn_mmhc <- tryCatch({
-    mmhc(bn_data, test = "mi", score = "bde", iss = 10)
+    mmhc(bn_data,
+         restrict.args = list(test = "mi"),
+         maximize.args = list(score = "bde", iss = 10))
   }, error = function(e) {
     cat("  MMHC failed:", e$message, "\n")
-    tryCatch(mmhc(bn_data, test = "x2", score = "bic"),
+    tryCatch(mmhc(bn_data,
+                  restrict.args = list(test = "x2"),
+                  maximize.args = list(score = "bic")),
              error = function(e2) NULL)
   })
 })
@@ -199,7 +207,9 @@ if (!is.null(bn_mmhc)) {
 cat("\n── 5. H2PC ───────────────────────────────────────────────\n")
 t5 <- system.time({
   bn_h2pc <- tryCatch({
-    h2pc(bn_data, test = "mi", score = "bde", iss = 10)
+    h2pc(bn_data,
+         restrict.args = list(test = "mi"),
+         maximize.args = list(score = "bde", iss = 10))
   }, error = function(e) {
     cat("  H2PC failed:", e$message, "\n")
     NULL

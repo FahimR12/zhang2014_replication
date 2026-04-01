@@ -69,6 +69,80 @@ if (!is.null(cnv_discrete)) {
   cat("  CNV:", nrow(cnv_discrete), "genes ×", ncol(cnv_discrete), "samples\n")
 }
 
+# ── Remap methylation probe IDs → gene names (if step 2 annotation failed) ───
+# If the Illumina probe-to-gene annotation package was unavailable in Step 2,
+# meth_discrete retains probe IDs (e.g. "cg12345678") as rownames rather than
+# gene symbols.  Probe IDs never intersect with expression gene names, so zero
+# methylation features would be selected regardless of SCBS performance.
+# Detect this and attempt a remap using the probe_gene_mapping.rds saved by
+# Step 2 (if present), or skip methylation with a clear warning.
+METH_HAS_PROBES <- grepl("^cg[0-9]", rownames(meth_discrete)[1])
+
+if (METH_HAS_PROBES) {
+  cat("\n  NOTE: Methylation matrix has probe IDs as rownames (gene mapping was\n")
+  cat("  unavailable in Step 2). Attempting remap from probe_gene_mapping.rds...\n")
+
+  probe_map_file <- file.path(INPUT_DIR, "probe_gene_mapping.rds")
+  if (file.exists(probe_map_file)) {
+    probe_map <- readRDS(probe_map_file)
+    # probe_map has columns: probe_id, gene_name
+    # Average beta values across probes mapping to the same gene
+    common_probes <- intersect(rownames(meth_discrete), probe_map$probe_id)
+    if (length(common_probes) > 0) {
+      genes_to_remap <- unique(probe_map$gene_name[probe_map$probe_id %in% common_probes])
+      genes_to_remap <- genes_to_remap[!is.na(genes_to_remap) & genes_to_remap != ""]
+      cat("  Remapping", length(common_probes), "probes →", length(genes_to_remap), "genes\n")
+
+      meth_remapped <- matrix(NA_integer_,
+                              nrow = length(genes_to_remap),
+                              ncol = ncol(meth_discrete))
+      rownames(meth_remapped) <- genes_to_remap
+      colnames(meth_remapped) <- colnames(meth_discrete)
+
+      for (g in seq_along(genes_to_remap)) {
+        probes <- probe_map$probe_id[probe_map$gene_name == genes_to_remap[g] &
+                                       probe_map$probe_id %in% common_probes]
+        vals <- meth_discrete[probes, , drop = FALSE]
+        # Take most common discrete value (mode) across probes for each sample
+        meth_remapped[g, ] <- apply(vals, 2, function(x) {
+          ux <- x[!is.na(x)]
+          if (length(ux) == 0) return(NA_integer_)
+          as.integer(names(sort(table(ux), decreasing = TRUE))[1])
+        })
+      }
+      meth_discrete  <- meth_remapped
+      meth_continuous <- tryCatch(readRDS(file.path(INPUT_DIR, "meth_continuous_aligned.rds")),
+                                   error = function(e) NULL)
+      if (!is.null(meth_continuous) && grepl("^cg[0-9]", rownames(meth_continuous)[1])) {
+        # Also remap continuous methylation for SCBS correlation
+        meth_cont_remapped <- matrix(NA_real_,
+                                     nrow = length(genes_to_remap),
+                                     ncol = ncol(meth_continuous))
+        rownames(meth_cont_remapped) <- genes_to_remap
+        colnames(meth_cont_remapped) <- colnames(meth_continuous)
+        cont_common <- intersect(rownames(meth_continuous), probe_map$probe_id)
+        for (g in seq_along(genes_to_remap)) {
+          probes <- probe_map$probe_id[probe_map$gene_name == genes_to_remap[g] &
+                                         probe_map$probe_id %in% cont_common]
+          if (length(probes) == 0) next
+          vals <- meth_continuous[probes, , drop = FALSE]
+          meth_cont_remapped[g, ] <- colMeans(vals, na.rm = TRUE)
+        }
+        meth_continuous <- meth_cont_remapped
+      }
+      cat("  Remapped methylation matrix:", nrow(meth_discrete), "genes\n")
+    } else {
+      cat("  WARNING: No probe overlap between methylation data and mapping file.\n")
+      cat("  Methylation features will be excluded from BN.\n")
+    }
+  } else {
+    cat("  WARNING: probe_gene_mapping.rds not found. Re-run Step 2 with\n")
+    cat("  IlluminaHumanMethylation27kanno.ilmn12.hg19 installed, or run:\n")
+    cat("  BiocManager::install('IlluminaHumanMethylation27kanno.ilmn12.hg19')\n")
+    cat("  Methylation features will be excluded from BN.\n")
+  }
+}
+
 # =============================================================================
 # 1. DEFINE SEED GENES (Tables 2 and 3 from the paper)
 # =============================================================================
@@ -537,20 +611,29 @@ cat("  Expression features:", length(expr_features), "(paper had 177→245)\n")
 # =============================================================================
 cat("\n── Building Final Feature Matrix for BN ──────────────────\n")
 
-# Combine all features into a single sample × node data frame
-# Using discretized values as per the paper
+# ── Normalise column names to 12-char patient IDs ────────────────────────────
+# All aligned matrices cover the same patients but retain their platform-
+# specific full TCGA barcodes.  For example, expression aliquots end in
+# "01A-01D-XXXX-13" while CNV aliquots end in "01A-01B-XXXX-09" — the
+# platform suffix differs, so a raw intersect() on full barcodes returns
+# nothing and all non-expression modalities are silently dropped.
+# Trimming to the 12-char patient ID (TCGA-XX-XXXX) gives a common key.
+# The zero-fill mutation columns added in Step 2 are already bare patient IDs,
+# so substr(., 1, 12) is safe on both forms.
+norm_pid <- function(mat) { colnames(mat) <- substr(colnames(mat), 1, 12); mat }
 
-# Align all features to same sample set
-all_barcodes <- colnames(ge_discrete)
+ge_disc_pid   <- norm_pid(ge_discrete)
+meth_disc_pid <- norm_pid(meth_discrete)
+mut_mat_pid   <- norm_pid(mut_matrix)
+cnv_disc_pid  <- if (!is.null(cnv_discrete)) norm_pid(cnv_discrete) else NULL
 
 # Expression nodes (3-level: low=1, medium=2, high=3)
-bn_data <- as.data.frame(t(ge_discrete[expr_features, ]))
+bn_data <- as.data.frame(t(ge_disc_pid[expr_features, ]))
 colnames(bn_data) <- paste0("EXPR_", expr_features)
 
 # CNV nodes (binary: gain=1, loss=0)
-if (length(cnv_features) > 0) {
-  cnv_sub <- t(cnv_discrete[cnv_features, , drop = FALSE])
-  # Align samples
+if (length(cnv_features) > 0 && !is.null(cnv_disc_pid)) {
+  cnv_sub        <- t(cnv_disc_pid[cnv_features, , drop = FALSE])
   common_samples <- intersect(rownames(bn_data), rownames(cnv_sub))
   if (length(common_samples) > 0) {
     cnv_df <- as.data.frame(cnv_sub[common_samples, , drop = FALSE])
@@ -561,7 +644,7 @@ if (length(cnv_features) > 0) {
 
 # Methylation nodes (binary: hypo=1, hyper=2)
 if (length(meth_features) > 0) {
-  meth_sub <- t(meth_discrete[meth_features, , drop = FALSE])
+  meth_sub       <- t(meth_disc_pid[meth_features, , drop = FALSE])
   common_samples <- intersect(rownames(bn_data), rownames(meth_sub))
   if (length(common_samples) > 0) {
     meth_df <- as.data.frame(meth_sub[common_samples, , drop = FALSE])
@@ -572,7 +655,7 @@ if (length(meth_features) > 0) {
 
 # Mutation nodes (binary: 0/1)
 if (length(mut_features) > 0) {
-  mut_sub <- t(mut_matrix[mut_features, , drop = FALSE])
+  mut_sub        <- t(mut_mat_pid[mut_features, , drop = FALSE])
   common_samples <- intersect(rownames(bn_data), rownames(mut_sub))
   if (length(common_samples) > 0) {
     mut_df <- as.data.frame(mut_sub[common_samples, , drop = FALSE])
