@@ -29,7 +29,8 @@ PROJECT_DIR <- if (length(script_path) > 0) {
 } else {
   normalizePath(getwd(), winslash = "/", mustWork = FALSE)
 }
-OUT_DIR  <- file.path(PROJECT_DIR, "data")
+DATA_ROOT_DIR <- file.path(PROJECT_DIR, "data")
+OUT_DIR  <- file.path(DATA_ROOT_DIR, "01_data_loading")
 dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 GE_DIR   <- file.path(DATA_ROOT, "Transcriptome_Profiling",    "Gene_Expression_Quantification")

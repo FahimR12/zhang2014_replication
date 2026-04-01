@@ -28,9 +28,9 @@ PROJECT_DIR <- if (length(script_path) > 0) {
 } else {
   normalizePath(getwd(), winslash = "/", mustWork = FALSE)
 }
-DATA_DIR <- file.path(PROJECT_DIR, "data")
+DATA_DIR <- file.path(PROJECT_DIR, "data", "03_feature_selection")
 
-RESULTS_DIR <- file.path(PROJECT_DIR, "results")
+RESULTS_DIR <- file.path(PROJECT_DIR, "results", "04_bn_learning")
 dir.create(RESULTS_DIR, recursive = TRUE, showWarnings = FALSE)
 
 N_CORES <- max(1, detectCores() - 1)  # Leave one core free

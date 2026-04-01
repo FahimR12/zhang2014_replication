@@ -30,9 +30,12 @@ PROJECT_DIR <- if (length(script_path) > 0) {
 } else {
   normalizePath(getwd(), winslash = "/", mustWork = FALSE)
 }
-DATA_DIR <- file.path(PROJECT_DIR, "data")
-RESULTS_DIR <- file.path(PROJECT_DIR, "results")
-PLOTS_DIR   <- "plots"
+PREPROCESS_DIR <- file.path(PROJECT_DIR, "data", "02_preprocessing")
+DATA_DIR <- file.path(PROJECT_DIR, "data", "03_feature_selection")
+RESULTS_DIR <- file.path(PROJECT_DIR, "results", "04_bn_learning")
+ANALYSIS_DIR <- file.path(PROJECT_DIR, "results", "05_analysis")
+PLOTS_DIR   <- file.path(ANALYSIS_DIR, "plots")
+dir.create(ANALYSIS_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(PLOTS_DIR, recursive = TRUE, showWarnings = FALSE)
 
 cat("=== Zhang et al. 2014 Replication — Step 5: Analysis ===\n\n")
@@ -44,7 +47,7 @@ bn_data     <- readRDS(file.path(DATA_DIR, "bn_data.rds"))
 feature_lists <- readRDS(file.path(DATA_DIR, "feature_lists.rds"))
 
 # Load continuous expression for clustering/MDS
-ge_continuous <- tryCatch(readRDS(file.path(DATA_DIR, "ge_continuous_aligned.rds")),
+ge_continuous <- tryCatch(readRDS(file.path(PREPROCESS_DIR, "ge_continuous_aligned.rds")),
                           error = function(e) NULL)
 
 # Use the best bnlearn result (typically tabu or HC)
@@ -178,7 +181,7 @@ if (!is.null(ge_continuous) && length(expr_gene_names) > 10) {
            width = 6, height = 5)
     cat("  Saved: plots/fig6b_optimal_k.pdf\n")
 
-    saveRDS(gene_clusters, file.path(RESULTS_DIR, "gene_clusters.rds"))
+    saveRDS(gene_clusters, file.path(ANALYSIS_DIR, "gene_clusters.rds"))
   }
 }
 
@@ -326,7 +329,7 @@ if (exists("gene_clusters") && narcs(best_bn) > 0) {
                          fun.aggregate = length, value.var = "from")
     cat("  Within/between cluster causal edges:\n")
     print(cross_table)
-    fwrite(cross_table, file.path(RESULTS_DIR, "table5_cluster_edges.csv"))
+    fwrite(cross_table, file.path(ANALYSIS_DIR, "table5_cluster_edges.csv"))
   }
 }
 
@@ -357,7 +360,7 @@ if (nrow(comp_df) > 0) {
          width = 10, height = 6)
   cat("  Saved: plots/algorithm_comparison.pdf\n")
 
-  fwrite(comp_df, file.path(RESULTS_DIR, "algorithm_comparison.csv"))
+  fwrite(comp_df, file.path(ANALYSIS_DIR, "algorithm_comparison.csv"))
 }
 
 # =============================================================================
@@ -456,5 +459,5 @@ if (length(overlap_hubs) > 0) {
 }
 
 cat("\nAll plots saved to:", PLOTS_DIR, "\n")
-cat("All results saved to:", RESULTS_DIR, "\n")
+cat("Analysis outputs saved to:", ANALYSIS_DIR, "\n")
 cat("\n=== Analysis Complete ===\n")

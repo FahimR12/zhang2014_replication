@@ -51,21 +51,25 @@ PROJECT_DIR <- if (length(script_path) > 0) {
 } else {
   normalizePath(getwd(), winslash = "/", mustWork = FALSE)
 }
-DATA_DIR <- file.path(PROJECT_DIR, "data")
+DATA_ROOT_DIR <- file.path(PROJECT_DIR, "data")
+INPUT_DIR <- file.path(DATA_ROOT_DIR, "01_data_loading")
+OUTPUT_DIR <- file.path(DATA_ROOT_DIR, "02_preprocessing")
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 N_CORES <- min(8L, max(1L, detectCores() - 1L))
 
 cat("=== Zhang et al. 2014 Replication — Step 2: Preprocessing ===\n")
-cat("Data dir:", DATA_DIR, "\n")
+cat("Input dir:", INPUT_DIR, "\n")
+cat("Output dir:", OUTPUT_DIR, "\n")
 cat("Parallel workers:", N_CORES, "\n\n")
 
 # ── Load saved matrices from Step 1 ──────────────────────────────────────────
-ge_matrix   <- readRDS(file.path(DATA_DIR, "ge_matrix.rds"))
-cnv_segments <- readRDS(file.path(DATA_DIR, "cnv_segments.rds"))
-meth_matrix <- readRDS(file.path(DATA_DIR, "meth_matrix.rds"))
-mut_matrix  <- readRDS(file.path(DATA_DIR, "mut_matrix.rds"))
-sample_info <- readRDS(file.path(DATA_DIR, "sample_info.rds"))
-gene_info   <- readRDS(file.path(DATA_DIR, "gene_info.rds"))
+ge_matrix   <- readRDS(file.path(INPUT_DIR, "ge_matrix.rds"))
+cnv_segments <- readRDS(file.path(INPUT_DIR, "cnv_segments.rds"))
+meth_matrix <- readRDS(file.path(INPUT_DIR, "meth_matrix.rds"))
+mut_matrix  <- readRDS(file.path(INPUT_DIR, "mut_matrix.rds"))
+sample_info <- readRDS(file.path(INPUT_DIR, "sample_info.rds"))
+gene_info   <- readRDS(file.path(INPUT_DIR, "gene_info.rds"))
 
 cat("Loaded matrices:\n")
 cat("  Expression:", nrow(ge_matrix), "×", ncol(ge_matrix), "\n")
@@ -77,7 +81,85 @@ cat("  Mutation:", nrow(mut_matrix), "×", ncol(mut_matrix), "\n\n")
 # =============================================================================
 cat("── Fetching Gene Coordinates ─────────────────────────────\n")
 
-gene_coords_file <- file.path(DATA_DIR, "gene_coordinates.rds")
+gene_coords_file <- file.path(OUTPUT_DIR, "gene_coordinates.rds")
+
+fetch_gene_coordinates_rest <- function(genes, batch_size = 200L) {
+  genes <- unique(genes[!is.na(genes) & nzchar(genes)])
+  if (length(genes) == 0) {
+    return(data.table(
+      gene_name = character(),
+      chr = character(),
+      start = integer(),
+      end = integer(),
+      strand = integer(),
+      tss = integer()
+    ))
+  }
+
+  gene_batches <- split(genes, ceiling(seq_along(genes) / batch_size))
+  all_coords <- vector("list", length(gene_batches))
+
+  for (i in seq_along(gene_batches)) {
+    batch <- gene_batches[[i]]
+    resp <- tryCatch(
+      httr::POST(
+        "https://rest.ensembl.org/lookup/symbol/homo_sapiens",
+        httr::add_headers("Content-Type" = "application/json", "Accept" = "application/json"),
+        body = charToRaw(jsonlite::toJSON(list(symbols = batch), auto_unbox = TRUE)),
+        encode = "raw",
+        httr::timeout(60)
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(resp) || httr::status_code(resp) != 200) next
+
+    payload <- tryCatch(
+      jsonlite::fromJSON(httr::content(resp, "text", encoding = "UTF-8"),
+                         simplifyDataFrame = FALSE),
+      error = function(e) NULL
+    )
+    if (is.null(payload) || length(payload) == 0) next
+
+    batch_dt <- rbindlist(lapply(names(payload), function(symbol) {
+      item <- payload[[symbol]]
+      if (is.null(item) || is.null(item$seq_region_name) ||
+          is.null(item$start) || is.null(item$end)) {
+        return(NULL)
+      }
+
+      chr <- as.character(item$seq_region_name)
+      if (!(chr %in% c(as.character(1:22), "X", "Y"))) return(NULL)
+
+      data.table(
+        gene_name = if (!is.null(item$display_name)) item$display_name else symbol,
+        chr = chr,
+        start = as.integer(item$start),
+        end = as.integer(item$end),
+        strand = if (!is.null(item$strand)) as.integer(item$strand) else NA_integer_,
+        tss = if (!is.null(item$strand) && !is.null(item$start) && !is.null(item$end)) {
+          if (as.integer(item$strand) >= 0L) as.integer(item$start) else as.integer(item$end)
+        } else {
+          NA_integer_
+        }
+      )
+    }), fill = TRUE)
+
+    all_coords[[i]] <- batch_dt
+    if (i %% 10 == 0 || i == length(gene_batches)) {
+      cat("    REST batches:", i, "/", length(gene_batches), "\n")
+    }
+    Sys.sleep(0.1)
+  }
+
+  coords <- rbindlist(all_coords, fill = TRUE)
+  if (nrow(coords) == 0) return(coords)
+
+  coords[, gene_length := end - start]
+  coords <- coords[coords[, .I[which.max(gene_length)], by = gene_name]$V1]
+  coords[, gene_length := NULL]
+  coords
+}
 
 if (file.exists(gene_coords_file)) {
   gene_coords <- readRDS(gene_coords_file)
@@ -128,6 +210,18 @@ if (file.exists(gene_coords_file)) {
     )
     cat("  Warning: Could not get gene coordinates. CNV mapping will be limited.\n")
   })
+}
+
+if (all(is.na(gene_coords$chr))) {
+  cat("  Attempting alternative approach via Ensembl REST API...\n")
+  rest_coords <- fetch_gene_coordinates_rest(unique(c(rownames(ge_matrix), rownames(mut_matrix))))
+  if (nrow(rest_coords) > 0) {
+    gene_coords <- rest_coords
+    saveRDS(gene_coords, gene_coords_file)
+    cat("  Retrieved coordinates for", nrow(gene_coords), "genes via REST\n")
+  } else {
+    cat("  Warning: Ensembl REST lookup also failed. CNV mapping will be limited.\n")
+  }
 }
 
 # =============================================================================
@@ -245,8 +339,17 @@ cat("\n── Mapping CNV Segments to Genes ────────────
 # Genes spanning two segments were not assigned a value (236 out of 15,352)
 
 if (!all(is.na(gene_coords$chr))) {
-  cat("  Mapping segments to", nrow(gene_coords), "genes using", N_CORES, "cores...\n")
-
+  gene_coords_cnv <- copy(gene_coords)[
+    !is.na(chr) & !is.na(start) & !is.na(end),
+    .(
+      gene_name,
+      chr_clean = as.character(chr),
+      start = as.integer(pmin(start, end)),
+      end = as.integer(pmax(start, end))
+    )
+  ]
+  gene_coords_cnv <- gene_coords_cnv[chr_clean %in% c(as.character(1:22), "X", "Y")]
+  cat("  Mapping segments to", nrow(gene_coords_cnv), "genes using", N_CORES, "cores...\n")
   unique_cnv_samples <- unique(cnv_segments$sample_barcode)
 
   # ── Parallel CNV mapping: one job per sample ──────────────────────────────
@@ -254,25 +357,29 @@ if (!all(is.na(gene_coords$chr))) {
   # This is the dominant bottleneck (1564 samples × ~15K genes).
   cl <- makeCluster(N_CORES, type = "PSOCK")
   clusterEvalQ(cl, suppressPackageStartupMessages(library(data.table)))
-  clusterExport(cl, c("cnv_segments", "gene_coords", "unique_cnv_samples"))
+  clusterExport(cl, c("cnv_segments", "gene_coords_cnv"))
 
   cnv_per_sample <- parLapply(cl, unique_cnv_samples, function(sample_id) {
-    segs <- cnv_segments[sample_barcode == sample_id]
+    segs <- copy(cnv_segments[sample_barcode == sample_id, .(Chromosome, Start, End, Segment_Mean)])
     segs[, chr_clean := gsub("^chr", "", Chromosome)]
+    segs[, `:=`(Start = as.integer(pmin(Start, End)), End = as.integer(pmax(Start, End)))]
+    segs <- segs[!is.na(chr_clean) & !is.na(Start) & !is.na(End)]
+    if (nrow(segs) == 0) return(rep(NA_real_, nrow(gene_coords_cnv)))
 
-    vals <- numeric(nrow(gene_coords))
-    vals[] <- NA_real_
+    setkey(segs, chr_clean, Start, End)
+    overlaps <- foverlaps(
+      gene_coords_cnv,
+      segs[, .(chr_clean, Start, End, Segment_Mean)],
+      by.x = c("chr_clean", "start", "end"),
+      by.y = c("chr_clean", "Start", "End"),
+      type = "within",
+      nomatch = 0L
+    )
 
-    for (g in seq_len(nrow(gene_coords))) {
-      gc <- gene_coords[g]
-      if (is.na(gc$chr)) next
-
-      ov <- segs[chr_clean == gc$chr & Start <= gc$start & End >= gc$end]
-      if (nrow(ov) == 1) {
-        vals[g] <- ov$Segment_Mean[1]
-      } else if (nrow(ov) > 1) {
-        vals[g] <- mean(ov$Segment_Mean)
-      }
+    vals <- rep(NA_real_, nrow(gene_coords_cnv))
+    if (nrow(overlaps) > 0) {
+      gene_means <- overlaps[, .(Segment_Mean = mean(Segment_Mean, na.rm = TRUE)), by = gene_name]
+      vals[match(gene_means$gene_name, gene_coords_cnv$gene_name)] <- gene_means$Segment_Mean
     }
     vals
   })
@@ -281,7 +388,7 @@ if (!all(is.na(gene_coords$chr))) {
 
   # Assemble matrix from list of column vectors
   cnv_gene_matrix           <- do.call(cbind, cnv_per_sample)
-  rownames(cnv_gene_matrix) <- gene_coords$gene_name
+  rownames(cnv_gene_matrix) <- gene_coords_cnv$gene_name
   colnames(cnv_gene_matrix) <- unique_cnv_samples
   rm(cnv_per_sample); gc()
 
@@ -308,7 +415,7 @@ cat("\n── Mapping Methylation Probes to Gene Promoters ───────
 # Download manifest or use built-in annotation
 cat("  Loading Illumina probe-to-gene mapping...\n")
 
-probe_gene_file <- file.path(DATA_DIR, "probe_gene_mapping.rds")
+probe_gene_file <- file.path(OUTPUT_DIR, "probe_gene_mapping.rds")
 
 if (file.exists(probe_gene_file)) {
   probe_gene_map <- readRDS(probe_gene_file)
@@ -561,28 +668,29 @@ if (!is.null(cnv_discrete)) {
 # =============================================================================
 cat("\n── Saving Preprocessed Data ──────────────────────────────\n")
 
-saveRDS(ge_corrected, file.path(DATA_DIR, "ge_corrected.rds"))
-saveRDS(ge_discrete, file.path(DATA_DIR, "ge_discrete.rds"))
-saveRDS(meth_gene_matrix, file.path(DATA_DIR, "meth_gene_matrix.rds"))
-saveRDS(meth_discrete, file.path(DATA_DIR, "meth_discrete.rds"))
-if (!is.null(cnv_gene_matrix)) saveRDS(cnv_gene_matrix, file.path(DATA_DIR, "cnv_gene_matrix.rds"))
-if (!is.null(cnv_discrete)) saveRDS(cnv_discrete, file.path(DATA_DIR, "cnv_discrete.rds"))
+saveRDS(ge_corrected, file.path(OUTPUT_DIR, "ge_corrected.rds"))
+saveRDS(ge_discrete, file.path(OUTPUT_DIR, "ge_discrete.rds"))
+saveRDS(meth_gene_matrix, file.path(OUTPUT_DIR, "meth_gene_matrix.rds"))
+saveRDS(meth_discrete, file.path(OUTPUT_DIR, "meth_discrete.rds"))
+if (!is.null(cnv_gene_matrix)) saveRDS(cnv_gene_matrix, file.path(OUTPUT_DIR, "cnv_gene_matrix.rds"))
+if (!is.null(cnv_discrete)) saveRDS(cnv_discrete, file.path(OUTPUT_DIR, "cnv_discrete.rds"))
 
 # Save aligned versions
-saveRDS(ge_aligned, file.path(DATA_DIR, "ge_aligned.rds"))
-saveRDS(meth_aligned, file.path(DATA_DIR, "meth_aligned.rds"))
-saveRDS(mut_aligned, file.path(DATA_DIR, "mut_aligned.rds"))
-if (!is.null(cnv_discrete)) saveRDS(cnv_aligned, file.path(DATA_DIR, "cnv_aligned.rds"))
+saveRDS(ge_aligned, file.path(OUTPUT_DIR, "ge_aligned.rds"))
+saveRDS(meth_aligned, file.path(OUTPUT_DIR, "meth_aligned.rds"))
+saveRDS(mut_aligned, file.path(OUTPUT_DIR, "mut_aligned.rds"))
+if (!is.null(cnv_discrete)) saveRDS(cnv_aligned, file.path(OUTPUT_DIR, "cnv_aligned.rds"))
+saveRDS(sample_info, file.path(OUTPUT_DIR, "sample_info.rds"))
 
 # Save continuous (non-discretized) aligned versions for correlation analysis
 ge_cont_aligned <- subset_to_patients(ge_corrected, ge_patients, common_patients)
 meth_cont_aligned <- subset_to_patients(meth_gene_matrix, meth_patients, common_patients)
-saveRDS(ge_cont_aligned, file.path(DATA_DIR, "ge_continuous_aligned.rds"))
-saveRDS(meth_cont_aligned, file.path(DATA_DIR, "meth_continuous_aligned.rds"))
+saveRDS(ge_cont_aligned, file.path(OUTPUT_DIR, "ge_continuous_aligned.rds"))
+saveRDS(meth_cont_aligned, file.path(OUTPUT_DIR, "meth_continuous_aligned.rds"))
 
 # Save gene coordinate info
 if (exists("gene_coords")) saveRDS(gene_coords, gene_coords_file)
 
-cat("  All preprocessed data saved\n")
+cat("  All preprocessed data saved to:", OUTPUT_DIR, "\n")
 cat("\n=== Preprocessing Complete ===\n")
 cat("Run 03_feature_selection.R next.\n")

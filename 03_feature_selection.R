@@ -30,22 +30,25 @@ PROJECT_DIR <- if (length(script_path) > 0) {
 } else {
   normalizePath(getwd(), winslash = "/", mustWork = FALSE)
 }
-DATA_DIR <- file.path(PROJECT_DIR, "data")
+DATA_ROOT_DIR <- file.path(PROJECT_DIR, "data")
+INPUT_DIR <- file.path(DATA_ROOT_DIR, "02_preprocessing")
+OUTPUT_DIR <- file.path(DATA_ROOT_DIR, "03_feature_selection")
+dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
 N_CORES  <- min(8L, max(1L, detectCores() - 1L))
 
 cat("=== Zhang et al. 2014 Replication — Step 3: Feature Selection ===\n")
 cat("Parallel workers:", N_CORES, "\n\n")
 
 # ── Load preprocessed data ────────────────────────────────────────────────────
-ge_discrete    <- readRDS(file.path(DATA_DIR, "ge_aligned.rds"))
-meth_discrete  <- readRDS(file.path(DATA_DIR, "meth_aligned.rds"))
-mut_matrix     <- readRDS(file.path(DATA_DIR, "mut_aligned.rds"))
-ge_continuous  <- readRDS(file.path(DATA_DIR, "ge_continuous_aligned.rds"))
-meth_continuous <- readRDS(file.path(DATA_DIR, "meth_continuous_aligned.rds"))
-sample_info    <- readRDS(file.path(DATA_DIR, "sample_info.rds"))
+ge_discrete    <- readRDS(file.path(INPUT_DIR, "ge_aligned.rds"))
+meth_discrete  <- readRDS(file.path(INPUT_DIR, "meth_aligned.rds"))
+mut_matrix     <- readRDS(file.path(INPUT_DIR, "mut_aligned.rds"))
+ge_continuous  <- readRDS(file.path(INPUT_DIR, "ge_continuous_aligned.rds"))
+meth_continuous <- readRDS(file.path(INPUT_DIR, "meth_continuous_aligned.rds"))
+sample_info    <- readRDS(file.path(INPUT_DIR, "sample_info.rds"))
 
 # Try to load CNV
-cnv_discrete <- tryCatch(readRDS(file.path(DATA_DIR, "cnv_aligned.rds")),
+cnv_discrete <- tryCatch(readRDS(file.path(INPUT_DIR, "cnv_aligned.rds")),
                          error = function(e) NULL)
 
 cat("Loaded aligned matrices:\n")
@@ -420,11 +423,8 @@ run_scbs <- function(seed_genes, feature_matrix, k = 5, max_features = 300,
     selected  <- c(selected, sig_new)
     remaining <- setdiff(remaining, sig_new)
 
-      if (iteration %% 5 == 0 || iteration <= 3) {
-        cat("    Iteration", iteration, ": selected", length(selected), "features\n")
-      }
-    } else {
-      break  # No new candidates found
+    if (iteration %% 5 == 0 || iteration <= 3) {
+      cat("    Iteration", iteration, ": selected", length(selected), "features\n")
     }
 
     if (length(selected) >= max_features) break
@@ -600,9 +600,9 @@ cat("  Breakdown: ", n_expr, "expression |", n_cnv, "CNV |",
 # =============================================================================
 cat("\n── Saving Feature Selection Results ──────────────────────\n")
 
-saveRDS(bn_data, file.path(DATA_DIR, "bn_data.rds"))
-saveRDS(selected_genes, file.path(DATA_DIR, "selected_genes.rds"))
-saveRDS(seed_genes_final, file.path(DATA_DIR, "seed_genes.rds"))
+saveRDS(bn_data, file.path(OUTPUT_DIR, "bn_data.rds"))
+saveRDS(selected_genes, file.path(OUTPUT_DIR, "selected_genes.rds"))
+saveRDS(seed_genes_final, file.path(OUTPUT_DIR, "seed_genes.rds"))
 
 # Save feature lists
 feature_lists <- list(
@@ -614,9 +614,9 @@ feature_lists <- list(
   meth_features = meth_features,
   mut_features = mut_features
 )
-saveRDS(feature_lists, file.path(DATA_DIR, "feature_lists.rds"))
+saveRDS(feature_lists, file.path(OUTPUT_DIR, "feature_lists.rds"))
 
-cat("  Saved to:", DATA_DIR, "\n")
+cat("  Saved to:", OUTPUT_DIR, "\n")
 cat("\n=== Feature Selection Complete ===\n")
 cat("  Total nodes for BN:", ncol(bn_data), "\n")
 cat("  Total samples:", nrow(bn_data), "\n")
