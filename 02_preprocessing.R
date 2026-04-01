@@ -429,62 +429,125 @@ probe_gene_file <- file.path(OUTPUT_DIR, "probe_gene_mapping.rds")
 
 if (file.exists(probe_gene_file)) {
   probe_gene_map <- readRDS(probe_gene_file)
+  cat("  Loaded cached probe-gene mapping:", nrow(probe_gene_map), "entries\n")
 } else {
-  # Try to get probe annotation from GDC or Illumina manifest
-  # For Illumina 27K array, probes are named cg########
-  # We'll use a simplified mapping based on available annotation packages
+  # ── Three-tier annotation strategy (ordered by compilation safety) ──────────
+  #
+  # ROOT CAUSE OF PREVIOUS FAILURES:
+  # getAnnotation() is exported by minfi, which Suggests rtracklayer.
+  # On clusters with gcc 15, rtracklayer fails to compile from source:
+  #   ucsc/common.c:249: error: too many arguments to function 'free'
+  # This cascades: rtracklayer → GenomicFeatures → bumphunter → minfi → FAIL.
+  #
+  # FIX: the annotation data package itself only Imports BiocGenerics + Biobase
+  # (both pure R, no C).  We install with dependencies = c("Depends","Imports")
+  # to skip Suggests, then use Biobase::pData() instead of getAnnotation().
+  #
+  # Tier 1: Illumina 27K annotation (pure-R data package, no C compilation)
+  # Tier 2: Illumina 450K same strategy
+  # Tier 3: Download manifest CSV from GitHub package source via fread()
+  #         — zero R package dependencies, fread reads HTTPS natively
 
-  tryCatch({
-    if (!requireNamespace("IlluminaHumanMethylation27kanno.ilmn12.hg19", quietly = TRUE)) {
+  # ── Helper: extract probe-gene map from a loaded annotation object ──────────
+  extract_probe_map <- function(ann_pkg_name) {
+    # Use Biobase::pData() which ships with the annotation package itself.
+    # This avoids loading minfi entirely.
+    if (!requireNamespace("Biobase", quietly = TRUE))
+      stop("Biobase not available")
+    ann_obj <- get(ann_pkg_name,
+                   envir = asNamespace(ann_pkg_name))
+    ann_df  <- as.data.frame(Biobase::pData(ann_obj), stringsAsFactors = FALSE)
+    dt <- data.table(
+      probe_id   = rownames(ann_df),
+      gene_name  = ann_df$UCSC_RefGene_Name,
+      gene_group = ann_df$UCSC_RefGene_Group,
+      chr        = ann_df$chr,
+      pos        = ann_df$pos
+    )
+    dt <- dt[grepl("TSS|1stExon|5.UTR", gene_group, perl = TRUE)]
+    dt <- dt[, .(gene_name = unlist(strsplit(gene_name, ";"))),
+             by = .(probe_id, chr, pos)]
+    dt
+  }
+
+  probe_gene_map <- NULL
+
+  # ── Tier 1: Illumina 27K ────────────────────────────────────────────────────
+  probe_gene_map <- tryCatch({
+    pkg <- "IlluminaHumanMethylation27kanno.ilmn12.hg19"
+    if (!requireNamespace(pkg, quietly = TRUE)) {
       if (!requireNamespace("BiocManager", quietly = TRUE))
         install.packages("BiocManager", repos = "https://cran.r-project.org")
-      BiocManager::install("IlluminaHumanMethylation27kanno.ilmn12.hg19", ask = FALSE)
+      # IMPORTANT: dependencies = c("Depends","Imports") skips minfi (Suggests)
+      BiocManager::install(pkg,
+                           dependencies = c("Depends", "Imports"),
+                           ask = FALSE, update = FALSE)
     }
-    library(IlluminaHumanMethylation27kanno.ilmn12.hg19)
-    ann <- getAnnotation(IlluminaHumanMethylation27kanno.ilmn12.hg19)
-    probe_gene_map <- data.table(
-      probe_id = rownames(ann),
-      gene_name = ann$UCSC_RefGene_Name,
-      gene_group = ann$UCSC_RefGene_Group,
-      chr = ann$chr,
-      pos = ann$pos
-    )
-    # Keep promoter-associated probes (TSS200, TSS1500, 1stExon, 5'UTR)
-    probe_gene_map <- probe_gene_map[grepl("TSS|1stExon|5.UTR", gene_group)]
-
-    # Expand multi-gene probes
-    probe_gene_map <- probe_gene_map[, .(gene_name = unlist(strsplit(gene_name, ";"))),
-                                     by = .(probe_id, chr, pos)]
-
-    saveRDS(probe_gene_map, probe_gene_file)
-    cat("  Loaded", nrow(probe_gene_map), "promoter probe-gene mappings\n")
+    suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+    pm <- extract_probe_map(pkg)
+    cat("  Loaded Illumina 27K annotation:", nrow(pm), "promoter probe-gene mappings\n")
+    pm
   }, error = function(e) {
-    cat("  Could not load Illumina annotation:", e$message, "\n")
-    cat("  Trying 450K annotation as fallback...\n")
-
-    tryCatch({
-      if (!requireNamespace("IlluminaHumanMethylation450kanno.ilmn12.hg19", quietly = TRUE)) {
-        BiocManager::install("IlluminaHumanMethylation450kanno.ilmn12.hg19", ask = FALSE)
-      }
-      library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
-      ann <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
-      probe_gene_map <<- data.table(
-        probe_id = rownames(ann),
-        gene_name = ann$UCSC_RefGene_Name,
-        gene_group = ann$UCSC_RefGene_Group,
-        chr = ann$chr,
-        pos = ann$pos
-      )
-      probe_gene_map <<- probe_gene_map[grepl("TSS|1stExon|5.UTR", gene_group)]
-      probe_gene_map <<- probe_gene_map[, .(gene_name = unlist(strsplit(gene_name, ";"))),
-                                        by = .(probe_id, chr, pos)]
-      saveRDS(probe_gene_map, probe_gene_file)
-      cat("  Loaded", nrow(probe_gene_map), "promoter probe-gene mappings (450K)\n")
-    }, error = function(e2) {
-      cat("  Annotation packages not available. Creating minimal mapping.\n")
-      probe_gene_map <<- NULL
-    })
+    cat("  Tier 1 (27K) failed:", conditionMessage(e), "\n")
+    NULL
   })
+
+  # ── Tier 2: Illumina 450K (superset of 27K probes) ──────────────────────────
+  if (is.null(probe_gene_map)) {
+    probe_gene_map <- tryCatch({
+      pkg <- "IlluminaHumanMethylation450kanno.ilmn12.hg19"
+      if (!requireNamespace(pkg, quietly = TRUE)) {
+        BiocManager::install(pkg,
+                             dependencies = c("Depends", "Imports"),
+                             ask = FALSE, update = FALSE)
+      }
+      suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+      pm <- extract_probe_map(pkg)
+      # Filter to 27K probe IDs only (cg probes present in the methylation data)
+      meth_probes <- rownames(meth_matrix)
+      pm <- pm[probe_id %in% meth_probes]
+      cat("  Loaded Illumina 450K annotation (filtered to 27K probes):",
+          nrow(pm), "mappings\n")
+      pm
+    }, error = function(e) {
+      cat("  Tier 2 (450K) failed:", conditionMessage(e), "\n")
+      NULL
+    })
+  }
+
+  # ── Tier 3: Download manifest CSV via fread (no Bioconductor needed) ─────────
+  if (is.null(probe_gene_map)) {
+    probe_gene_map <- tryCatch({
+      cat("  Tier 3: downloading 27K manifest from GitHub package source...\n")
+      # The annotation package stores its data as a CSV in inst/extdata.
+      # We fetch directly from the Bioconductor GitHub mirror using fread HTTPS.
+      manifest_url <- paste0(
+        "https://raw.githubusercontent.com/",
+        "Bioconductor/IlluminaHumanMethylation27kanno.ilmn12.hg19/",
+        "devel/inst/extdata/",
+        "HumanMethylation27_270596_v.1.2.csv.gz"
+      )
+      raw <- fread(manifest_url, skip = 7L, header = TRUE,
+                   select = c("Name", "UCSC_RefGene_Name",
+                              "UCSC_RefGene_Group", "CHR", "MAPINFO"),
+                   showProgress = FALSE)
+      setnames(raw, c("probe_id", "gene_name", "gene_group", "chr", "pos"))
+      raw <- raw[grepl("TSS|1stExon|5.UTR", gene_group, perl = TRUE)]
+      raw <- raw[, .(gene_name = unlist(strsplit(gene_name, ";"))),
+                 by = .(probe_id, chr, pos)]
+      cat("  Downloaded manifest:", nrow(raw), "promoter probe-gene mappings\n")
+      raw
+    }, error = function(e) {
+      cat("  Tier 3 (manifest download) failed:", conditionMessage(e), "\n")
+      cat("  Methylation will remain probe-level (features skipped in BN).\n")
+      NULL
+    })
+  }
+
+  if (!is.null(probe_gene_map)) {
+    saveRDS(probe_gene_map, probe_gene_file)
+    cat("  Probe-gene mapping cached to:", probe_gene_file, "\n")
+  }
 }
 
 # Build gene-level methylation matrix
